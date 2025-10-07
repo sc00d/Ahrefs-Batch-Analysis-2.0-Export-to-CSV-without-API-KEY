@@ -1,8 +1,25 @@
 Скрипт для массово извлечения данных из Ahrefs Batch Analysis 2.0 без использованя API.
 
-❗️Скрипт дается только в познавательных целях. Автор не несет ответственности за блокировку акков или любые другие проблемы, которые могут возникнуть. 
+Скрипт дается только в познавательных целях. Автор не несет ответственности за блокировку акков или любые другие проблемы, которые могут возникнуть. 
 
 Автор - https://t.me/seregaseo
+
+Работает через расширение Tampermonkey
+
+Процесс работы:
+
+<img width="2709" height="1725" alt="image" src="https://github.com/user-attachments/assets/cc1617f2-4547-4685-8a15-5f007fd4a64b" />
+
+<img width="900" height="1059" alt="image" src="https://github.com/user-attachments/assets/7bd76c28-15c7-42c1-b817-78304a5a9d6e" />
+
+<img width="3816" height="1664" alt="image" src="https://github.com/user-attachments/assets/5e891849-8f1d-4379-a446-df803b959f23" />
+
+Итог:
+<img width="2122" height="362" alt="image" src="https://github.com/user-attachments/assets/900d464e-3bb8-4168-88aa-495197fd582d" />
+
+
+
+
 
 ***
 
