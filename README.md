@@ -26,14 +26,14 @@
 Сам код 
 
 ```// ==UserScript==
-// @name         Ahrefs Batch Analysis 2.0 Export to CSV (without API KEY) — Firefox-stable
+// @name         Ahrefs Batch Analysis 2.0 Export to CSV (no API) — FF-stable (no pagination, silent resume)
 // @namespace    http://tampermonkey.net/
-// @version      3.2
-// @description  Ahrefs Batch Analysis 2.0 Export to CSV (without API KEY) — fixes for SPA routing & Firefox timings
-// @author       Сергей Уткин (https://t.me/seregaseo)
+// @version      3.3.3
+// @description  Экспорт видимых 50 строк из Batch Analysis 2.0 c надёжным ожиданием формы, тихим автопродолжением и без пагинации/внешних кликов
+// @author       Sergey
 // @match        https://app.ahrefs.com/v2-batch-analysis*
-// @match        https://app.ahrefs.com/v2-batch-analysis/
-// @match        https://app.ahrefs.com/v2-batch-analysis/report*
+// @run-at       document-idle
+// @noframes
 // @grant        GM_download
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -41,554 +41,395 @@
 // ==/UserScript==
 
 (function () {
-    'use strict';
+  'use strict';
 
-    const CONFIG = {
-        DOMAINS_PER_BATCH: 50,
-        INITIAL_POSITION: { bottom: '20px', right: '40px' },
-        CONTAINER_SIZE: { width: '380px', height: '480px' },
-        DELAY_BETWEEN_ACTIONS: 2500,        // ↑ запас для Firefox
-        WAIT_FOR_TABLE_TIMEOUT: 60000       // ↑ запас для Firefox
-    };
+  const CONFIG = {
+    DOMAINS_PER_BATCH: 50,
+    INITIAL_POSITION: { bottom: '20px', right: '40px' },
+    CONTAINER_SIZE: { width: '380px', height: '480px' },
+    DELAY_BETWEEN_ACTIONS: 2500,      // запас для Firefox/SPA
+    WAIT_FOR_TABLE_TIMEOUT: 60000     // запас для Firefox/SPA
+  };
 
-    const styles = `
-        .custom-container {
-            position: fixed;
-            bottom: ${CONFIG.INITIAL_POSITION.bottom};
-            right: ${CONFIG.INITIAL_POSITION.right};
-            width: ${CONFIG.CONTAINER_SIZE.width};
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border: 2px solid #5a67d8;
-            border-radius: 12px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.25);
-            z-index: 10000;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            overflow: hidden;
+  const styles = `
+    .custom-container {
+      position: fixed;
+      bottom: ${CONFIG.INITIAL_POSITION.bottom};
+      right: ${CONFIG.INITIAL_POSITION.right};
+      width: ${CONFIG.CONTAINER_SIZE.width};
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border: 2px solid #5a67d8;
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+      z-index: 10000;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      overflow: hidden;
+    }
+    .custom-header {
+      padding: 12px 15px;
+      background: rgba(0,0,0,0.2);
+      color: white;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: move;
+      font-weight: 600;
+      font-size: 15px;
+      letter-spacing: 0.5px;
+    }
+    .custom-button {
+      background: rgba(255,255,255,0.2);
+      border: none;
+      color: white;
+      cursor: pointer;
+      height: 32px;
+      min-width: 32px;
+      padding: 0 10px;
+      border-radius: 8px;
+      font-size: 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s ease;
+    }
+    .custom-button:hover { background: rgba(255,255,255,0.3); transform: translateY(-1px); }
+    .custom-content { padding: 15px; display: flex; flex-direction: column; gap: 12px; background: white; }
+    .custom-textarea {
+      width: 100%; height: 260px; resize: none; padding: 10px;
+      border: 2px solid #e2e8f0; border-radius: 8px; font-family: 'Courier New', monospace; font-size: 13px;
+      transition: border-color 0.3s ease;
+    }
+    .custom-textarea:focus { outline: none; border-color: #667eea; }
+    .custom-start-button {
+      padding: 12px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;
+      border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px;
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+    }
+    .custom-stop-button {
+      padding: 12px; background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white;
+      border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px;
+      box-shadow: 0 4px 12px rgba(245, 87, 108, 0.3);
+    }
+    .status-info {
+      font-size: 12px; color: #4a5568; text-align: center; padding: 8px; background: #f7fafc;
+      border-radius: 6px; border-left: 4px solid #667eea; font-weight: 500;
+    }
+    .row-actions { display:flex; gap:8px; justify-content:space-between; }
+  `;
+  const styleSheet = document.createElement('style');
+  styleSheet.textContent = styles;
+  document.head.appendChild(styleSheet);
+
+  // Состояние/гварды
+  let isProcessing = false;          // активный цикл обработки
+  let currentBatch = 0;              // номер текущей пачки
+  let processingInFlight = false;    // защита от параллельных запусков
+  let urlChangeTimer = null;         // дебаунс urlchange
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function saveTextarea(text) { GM_setValue('ahrefsHelperText', text); }
+  function loadTextarea() { return GM_getValue('ahrefsHelperText', ''); }
+  function saveProcessingState(state) { GM_setValue('ahrefsProcessingState', JSON.stringify(state)); }
+  function loadProcessingState() { const s = GM_getValue('ahrefsProcessingState', null); return s ? JSON.parse(s) : null; }
+  function clearProcessingState() { GM_setValue('ahrefsProcessingState', ''); }
+
+  function setReactTextareaValue(textarea, value) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(textarea, value);
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  function waitForElement(selector, timeout = CONFIG.WAIT_FOR_TABLE_TIMEOUT) {
+    return new Promise((resolve, reject) => {
+      const exist = document.querySelector(selector);
+      if (exist) return resolve(exist);
+      const observer = new MutationObserver(() => {
+        const el = document.querySelector(selector);
+        if (el) { observer.disconnect(); resolve(el); }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      const to = setTimeout(() => { observer.disconnect(); reject(new Error(`Элемент ${selector} не найден за ${timeout}ms`)); }, timeout);
+      Promise.resolve().finally(() => clearTimeout(to));
+    });
+  }
+
+  // Жёсткий поиск Analyze: только button[type=button] по тексту, исключая UI скрипта.
+  async function waitForAnalyzeControls(timeout = 60000) {
+    const deadline = Date.now() + timeout;
+    const textarea = await waitForElement('textarea:not(.custom-textarea)', timeout);
+    let analyzeButton = Array.from(document.querySelectorAll('button[type="button"]'))
+      .find(b => b.textContent.trim().toLowerCase() === 'analyze' && !b.closest('.custom-container'));
+    while (!analyzeButton && Date.now() < deadline) {
+      await sleep(250);
+      analyzeButton = Array.from(document.querySelectorAll('button[type="button"]'))
+        .find(b => b.textContent.trim().toLowerCase() === 'analyze' && !b.closest('.custom-container'));
+    }
+    if (!analyzeButton) throw new Error('Кнопка Analyze не найдена');
+    return { textarea, analyzeButton };
+  }
+
+  function tableToVisibleCSV(table) {
+    const rows = [];
+    const headers = [
+      'Target','Mode','IP','Protocol','URL Rating','Domain Rating','Ahrefs Rank',
+      'Organic / Total Keywords','Organic / Keywords (Top 3)','Organic / Keywords (4-10)',
+      'Organic / Keywords (11-20)','Organic / Keywords (21-50)','Organic / Keywords (51+)',
+      'Organic / Traffic','Organic / Value','Organic / Top Countries','Organic / Location traffic',
+      'Paid / Keywords','Paid / Ads','Paid / Traffic','Paid / Cost',
+      'Ref. domains / All','Ref. domains / Followed','Ref. domains / Not followed',
+      'Ref. IPs / IPs','Ref. IPs / Subnets','Backlinks / All','Backlinks / Followed',
+      'Backlinks / Not followed','Backlinks / Redirects','Backlinks / Internal',
+      'Outgoing domains / Linked domains','Outgoing domains / Followed',
+      'Outgoing links / Outgoing links','Outgoing links / Followed'
+    ];
+    rows.push(headers.join('\t'));
+
+    const dataRows = table.querySelectorAll('tbody tr');
+    dataRows.forEach(tr => {
+      const tds = tr.querySelectorAll('td');
+      let nonEmpty = false;
+      tds.forEach(td => { if (td.textContent.trim() !== '') nonEmpty = true; });
+      if (!nonEmpty) return;
+
+      const row = [];
+      Array.from(tds).forEach((td, idx) => {
+        let cellText = td.textContent.trim()
+          .replace(/"/g, '""')
+          .replace(/\n/g, ' ')
+          .replace(/\s+/g, ' ')
+          .replace(/,/g, '');
+        if (/^\d[\d\s]*[\d)]$/.test(cellText)) cellText = cellText.replace(/\s/g, '');
+
+        if (idx === 0) {
+          // skip
+        } else if (idx === 1) {
+          cellText = cellText.replace(/\/$/, '');
+          row.push(cellText);       // Target
+          row.push('Subdomains');   // Mode
+        } else if (idx === 2) {
+          // protocol (исходной таблицы) — пропуск
+        } else if (idx === 3) {
+          row.push(cellText);       // IP
+          row.push('both');         // Protocol
+        } else {
+          row.push(cellText);
         }
-        .custom-header {
-            padding: 12px 15px;
-            background: rgba(0,0,0,0.2);
-            color: white;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            cursor: move;
-            font-weight: 600;
-            font-size: 15px;
-            letter-spacing: 0.5px;
+      });
+
+      for (let i = 0; i < row.length; i++) {
+        if (typeof row[i] === 'string' && /\([a-z]{2},\s*\d+\)/i.test(row[i])) {
+          const m = row[i].match(/\(([a-z]{2}),\s*(\d+)\)/i);
+          if (m) { row[i] = m[1]; row.splice(i + 1, 0, m[2]); break; }
         }
-        .custom-button {
-            background: rgba(255,255,255,0.2);
-            border: none;
-            color: white;
-            cursor: pointer;
-            width: 28px;
-            height: 28px;
-            border-radius: 50%;
-            font-size: 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.3s ease;
-        }
-        .custom-button:hover {
-            background: rgba(255,255,255,0.3);
-            transform: scale(1.1);
-        }
-        .custom-content {
-            padding: 15px;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            background: white;
-        }
-        .custom-textarea {
-            width: 100%;
-            height: 260px;
-            resize: none;
-            padding: 10px;
-            border: 2px solid #e2e8f0;
-            border-radius: 8px;
-            font-family: 'Courier New', monospace;
-            font-size: 13px;
-            transition: border-color 0.3s ease;
-        }
-        .custom-textarea:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        .custom-start-button {
-            padding: 12px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 600;
-            font-size: 14px;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-        }
-        .custom-start-button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
-        }
-        .custom-stop-button {
-            padding: 12px;
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 600;
-            font-size: 14px;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 12px rgba(245, 87, 108, 0.3);
-        }
-        .custom-stop-button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 16px rgba(245, 87, 108, 0.4);
-        }
-        .status-info {
-            font-size: 12px;
-            color: #4a5568;
-            text-align: center;
-            padding: 8px;
-            background: #f7fafc;
-            border-radius: 6px;
-            border-left: 4px solid #667eea;
-            font-weight: 500;
-        }
-        .copyright {
-            font-size: 12px;
-            text-align: center;
-            color: #718096;
-            padding: 8px 0 0 0;
-            border-top: 1px solid #e2e8f0;
-        }
-        .copyright a {
-            color: #667eea;
-            text-decoration: none;
-            font-weight: 600;
-            transition: color 0.3s ease;
-        }
-        .copyright a:hover {
-            color: #764ba2;
-        }
+      }
+
+      if (row.length > 1 && row.some((c, idx) => idx > 0 && c !== '')) {
+        rows.push(row.join('\t'));
+      }
+    });
+
+    return rows.join('\n');
+  }
+
+  function downloadCSV(csvContent, filename) {
+    const BOM = '\uFEFF';
+    const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = filename; link.style.visibility = 'hidden';
+    document.body.appendChild(link); link.click(); document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
+  }
+
+  function getFirstDomainFromBatch(batchDomains) {
+    if (!batchDomains || batchDomains.length === 0) return '';
+    const first = batchDomains[0].trim();
+    return first.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  }
+
+  async function processNextBatch() {
+    if (!isProcessing) return;
+    if (processingInFlight) return;
+    processingInFlight = true;
+
+    const state = loadProcessingState();
+    if (!state || state.domains.length === 0) {
+      processingInFlight = false;
+      stopProcessing();
+      alert('Все домены обработаны!');
+      return;
+    }
+
+    currentBatch++;
+    const batchDomains = state.domains.splice(0, CONFIG.DOMAINS_PER_BATCH);
+    const remaining = state.domains.length;
+    const firstDomain = getFirstDomainFromBatch(batchDomains);
+
+    updateStatus(`Пакет ${currentBatch}: ${batchDomains.length} доменов (осталось: ${remaining})`);
+    saveProcessingState(state);
+    saveTextarea(state.domains.join('\n'));
+
+    try {
+      const { textarea: inputTextarea, analyzeButton } = await waitForAnalyzeControls(60000);
+      setReactTextareaValue(inputTextarea, batchDomains.join('\n'));
+      inputTextarea.focus();
+
+      await sleep(CONFIG.DELAY_BETWEEN_ACTIONS);
+      analyzeButton.click();
+
+      await sleep(CONFIG.DELAY_BETWEEN_ACTIONS * 2);
+      const table = await waitForElement('table', CONFIG.WAIT_FOR_TABLE_TIMEOUT * 2);
+      await sleep(CONFIG.DELAY_BETWEEN_ACTIONS * 2);
+
+      const csvContent = tableToVisibleCSV(table);
+      const timestamp = new Date().toISOString().slice(0,10);
+      const filename = `batch_analysis_${firstDomain}_${timestamp}.csv`;
+      downloadCSV(csvContent, filename);
+
+      updateStatus(`Пакет ${currentBatch} экспортирован: ${filename}`);
+
+      // Разрешаем следующий цикл и переходим на ввод
+      processingInFlight = false;
+      await sleep(CONFIG.DELAY_BETWEEN_ACTIONS);
+      window.location.href = 'https://app.ahrefs.com/v2-batch-analysis/';
+    } catch (error) {
+      console.error('Ошибка:', error);
+      processingInFlight = false;
+      stopProcessing();
+      alert(`Ошибка при обработке пакета ${currentBatch}: ${error.message}`);
+    }
+  }
+
+  function startProcessing() {
+    const textarea = document.querySelector('.custom-textarea');
+    const lines = textarea.value.trim().split('\n').filter(l => l.trim());
+    if (lines.length === 0) { alert('Нет доменов для обработки!'); return; }
+    const domainRegex = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
+    const validDomains = lines.filter(domain => domainRegex.test(domain.trim()));
+    if (validDomains.length === 0) { alert('Не найдено валидных доменов!'); return; }
+
+    isProcessing = true;
+    currentBatch = 0;
+    processingInFlight = false;
+
+    saveProcessingState({ domains: validDomains, total: validDomains.length, startTime: new Date().toISOString() });
+    updateStatus(`Начало обработки: ${validDomains.length} доменов`);
+
+    const startBtn = document.querySelector('.custom-start-button');
+    if (startBtn) {
+      startBtn.textContent = 'Остановить';
+      startBtn.className = 'custom-stop-button';
+      startBtn.onclick = stopProcessing;
+    }
+
+    processNextBatch();
+  }
+
+  function stopProcessing() {
+    isProcessing = false;
+    processingInFlight = false;
+
+    const startBtn = document.querySelector('.custom-stop-button');
+    if (startBtn) {
+      startBtn.textContent = 'Запустить обработку';
+      startBtn.className = 'custom-start-button';
+      startBtn.onclick = startProcessing;
+    }
+
+    updateStatus('Обработка остановлена');
+    clearProcessingState();
+  }
+
+  function updateStatus(message) {
+    const statusElement = document.querySelector('.status-info');
+    if (statusElement) statusElement.textContent = message;
+  }
+
+  function initContainer() {
+    if (document.querySelector('.custom-container')) return;
+    const container = document.createElement('div');
+    container.className = 'custom-container';
+    container.innerHTML = `
+      <div class="custom-header">
+        <span>Ahrefs Batch Helper v3.3.3</span>
+        <button class="custom-button close-btn" title="Закрыть">×</button>
+      </div>
+      <div class="custom-content">
+        <textarea class="custom-textarea" placeholder="Введите домены (по одному на строку)..."></textarea>
+        <div class="status-info">Готов к работе</div>
+        <div class="row-actions">
+          <button class="custom-start-button">Запустить обработку</button>
+          <button class="custom-button" id="reset-state" title="Сбросить состояние">Сброс</button>
+        </div>
+      </div>
     `;
+    document.body.appendChild(container);
 
-    const styleSheet = document.createElement('style');
-    styleSheet.textContent = styles;
-    document.head.appendChild(styleSheet);
+    const textarea = container.querySelector('.custom-textarea');
+    const startBtn = container.querySelector('.custom-start-button');
+    const closeBtn = container.querySelector('.close-btn');
+    const resetBtn = container.querySelector('#reset-state');
 
-    // Состояние процесса
-    let isProcessing = false;
-    let currentBatch = 0;
-    let totalDomains = 0;
+    textarea.value = loadTextarea();
+    textarea.addEventListener('input', () => saveTextarea(textarea.value));
 
-    function saveTextarea(text) {
-        GM_setValue('ahrefsHelperText', text);
+    closeBtn.addEventListener('click', () => container.remove());
+    startBtn.addEventListener('click', startProcessing);
+    resetBtn.addEventListener('click', () => {
+      clearProcessingState();
+      updateStatus('Состояние очищено');
+      // остаёмся в текущем режиме; новый старт — через кнопку
+    });
+
+    // Тихое резюме — если есть незавершённая очередь, продолжим без confirm
+    resumeIfPending();
+  }
+
+  // Тихий автоподхват незавершённой очереди
+  function resumeIfPending() {
+    const state = loadProcessingState();
+    if (!state || !state.domains || state.domains.length === 0) return;
+
+    if (!isProcessing) isProcessing = true;
+    if (processingInFlight) return;
+
+    // Обновить кнопку состояния
+    const btn = document.querySelector('.custom-start-button, .custom-stop-button');
+    if (btn && !btn.classList.contains('custom-stop-button')) {
+      btn.textContent = 'Остановить';
+      btn.className = 'custom-stop-button';
+      btn.onclick = stopProcessing;
     }
-
-    function loadTextarea() {
-        return GM_getValue('ahrefsHelperText', '');
-    }
-
-    function saveProcessingState(state) {
-        GM_setValue('ahrefsProcessingState', JSON.stringify(state));
-    }
-
-    function loadProcessingState() {
-        const state = GM_getValue('ahrefsProcessingState', null);
-        return state ? JSON.parse(state) : null;
-    }
-
-    function clearProcessingState() {
-        GM_setValue('ahrefsProcessingState', '');
-    }
-
-    function setReactTextareaValue(textarea, value) {
-        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype,
-            'value'
-        ).set;
-        nativeInputValueSetter.call(textarea, value);
-        const event = new Event('input', { bubbles: true });
-        textarea.dispatchEvent(event);
-    }
-
-    function waitForElement(selector, timeout = CONFIG.WAIT_FOR_TABLE_TIMEOUT) {
-        return new Promise((resolve, reject) => {
-            const existing = document.querySelector(selector);
-            if (existing) return resolve(existing);
-
-            const observer = new MutationObserver(() => {
-                const el = document.querySelector(selector);
-                if (el) {
-                    observer.disconnect();
-                    resolve(el);
-                }
-            });
-
-            observer.observe(document.body, { childList: true, subtree: true });
-
-            const to = setTimeout(() => {
-                observer.disconnect();
-                reject(new Error(`Элемент ${selector} не найден за ${timeout}ms`));
-            }, timeout);
-
-            // Безопасность: если промис завершился ранее
-            Promise.resolve().finally(() => clearTimeout(to));
-        });
-    }
-
-    // Устойчивое ожидание textarea и кнопки Analyze (исключая свою панель)
-    async function waitForAnalyzeControls(timeout = 60000) {
-        const deadline = Date.now() + timeout;
-
-        // Ждём textarea (не нашу)
-        const textarea = await waitForElement('textarea:not(.custom-textarea)', timeout);
-
-        // Ждём кнопку Analyze вне нашей панели
-        async function findAnalyzeBtn() {
-            const btn = Array.from(document.querySelectorAll('button[type="button"]'))
-                .find(b => b.textContent.trim().toLowerCase() === 'analyze'
-                        && !b.closest('.custom-container'));
-            return btn || null;
-        }
-
-        let analyzeButton = await findAnalyzeBtn();
-        while (!analyzeButton && Date.now() < deadline) {
-            await new Promise(r => setTimeout(r, 250));
-            analyzeButton = await findAnalyzeBtn();
-        }
-        if (!analyzeButton) throw new Error('Кнопка Analyze не найдена');
-
-        return { textarea, analyzeButton };
-    }
-
-    function tableToCSV(table) {
-        const rows = [];
-
-        const headers = [
-            'Target',
-            'Mode',
-            'IP',
-            'Protocol',
-            'URL Rating',
-            'Domain Rating',
-            'Ahrefs Rank',
-            'Organic / Total Keywords',
-            'Organic / Keywords (Top 3)',
-            'Organic / Keywords (4-10)',
-            'Organic / Keywords (11-20)',
-            'Organic / Keywords (21-50)',
-            'Organic / Keywords (51+)',
-            'Organic / Traffic',
-            'Organic / Value',
-            'Organic / Top Countries',
-            'Organic / Location traffic',
-            'Paid / Keywords',
-            'Paid / Ads',
-            'Paid / Traffic',
-            'Paid / Cost',
-            'Ref. domains / All',
-            'Ref. domains / Followed',
-            'Ref. domains / Not followed',
-            'Ref. IPs / IPs',
-            'Ref. IPs / Subnets',
-            'Backlinks / All',
-            'Backlinks / Followed',
-            'Backlinks / Not followed',
-            'Backlinks / Redirects',
-            'Backlinks / Internal',
-            'Outgoing domains / Linked domains',
-            'Outgoing domains / Followed',
-            'Outgoing links / Outgoing links',
-            'Outgoing links / Followed'
-        ];
-
-        rows.push(headers.join('\t'));
-
-        const dataRows = table.querySelectorAll('tbody tr');
-
-        dataRows.forEach((tr) => {
-            const cells = tr.querySelectorAll('td');
-
-            let isEmpty = true;
-            cells.forEach(td => {
-                if (td.textContent.trim() !== '') {
-                    isEmpty = false;
-                }
-            });
-            if (isEmpty) return;
-
-            const cellsArray = Array.from(cells);
-            const row = [];
-
-            cellsArray.forEach((td, index) => {
-                let cellText = td.textContent.trim();
-
-                cellText = cellText.replace(/"/g, '""')
-                                  .replace(/\n/g, ' ')
-                                  .replace(/\s+/g, ' ')
-                                  .replace(/,/g, '');
-
-                if (cellText.match(/^\d[\d\s]*[\d)]$/)) {
-                    cellText = cellText.replace(/\s/g, '');
-                }
-
-                if (index === 0) {
-                    // пропускаем
-                } else if (index === 1) {
-                    cellText = cellText.replace(/\/$/, '');
-                    row.push(cellText);       // Target
-                    row.push('Subdomains');   // Mode
-                } else if (index === 2) {
-                    // Protocol в исходной таблице — пропускаем
-                } else if (index === 3) {
-                    row.push(cellText);       // IP
-                    row.push('both');         // Protocol
-                } else {
-                    row.push(cellText);
-                }
-            });
-
-            for (let i = 0; i < row.length; i++) {
-                if (typeof row[i] === 'string' && row[i].match(/\([a-z]{2},\s*\d+\)/i)) {
-                    const match = row[i].match(/\(([a-z]{2}),\s*(\d+)\)/i);
-                    if (match) {
-                        const countryCode = match[1];
-                        const traffic = match[2];
-                        row[i] = countryCode;
-                        row.splice(i + 1, 0, traffic);
-                        break;
-                    }
-                }
-            }
-
-            if (row.length > 1 && row.some((cell, idx) => idx > 0 && cell !== '')) {
-                rows.push(row.join('\t'));
-            }
-        });
-
-        return rows.join('\n');
-    }
-
-    function downloadCSV(csvContent, filename) {
-        const BOM = '\uFEFF';
-        const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.setAttribute('href', url);
-        link.setAttribute('download', filename);
-        link.style.visibility = 'hidden';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        setTimeout(() => URL.revokeObjectURL(url), 100);
-    }
-
-    function getFirstDomainFromBatch(batchDomains) {
-        if (!batchDomains || batchDomains.length === 0) return '';
-        const firstDomain = batchDomains[0].trim();
-        return firstDomain.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-    }
-
-    async function processNextBatch() {
-        if (!isProcessing) return;
-
-        const state = loadProcessingState();
-        if (!state || state.domains.length === 0) {
-            stopProcessing();
-            alert('Все домены обработаны!');
-            return;
-        }
-
-        currentBatch++;
-        const batchDomains = state.domains.splice(0, CONFIG.DOMAINS_PER_BATCH);
-        const remaining = state.domains.length;
-        const firstDomain = getFirstDomainFromBatch(batchDomains);
-
-        updateStatus(`Пакет ${currentBatch}: ${batchDomains.length} доменов (осталось: ${remaining})`);
-
-        saveProcessingState(state);
-        saveTextarea(state.domains.join('\n'));
-
-        try {
-            // Ждём реальную готовность формы
-            const { textarea: inputTextarea, analyzeButton } = await waitForAnalyzeControls(60000);
-
-            setReactTextareaValue(inputTextarea, batchDomains.join('\n'));
-            inputTextarea.focus();
-
-            await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS));
-            analyzeButton.click();
-
-            // Ждём переход на отчёт и таблицу
-            await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS * 2));
-            const table = await waitForElement('table', CONFIG.WAIT_FOR_TABLE_TIMEOUT * 2);
-
-            // Дать время на полную отрисовку
-            await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS * 2));
-
-            const csvContent = tableToCSV(table);
-            const timestamp = new Date().toISOString().slice(0,10).replace(/-/g, '-');
-            const filename = `batch_analysis_${firstDomain}_${timestamp}.csv`;
-
-            downloadCSV(csvContent, filename);
-
-            updateStatus(`Пакет ${currentBatch} экспортирован: ${filename}`);
-
-            await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS));
-            window.location.href = 'https://app.ahrefs.com/v2-batch-analysis/';
-        } catch (error) {
-            console.error('Ошибка:', error);
-            stopProcessing();
-            alert(`Ошибка при обработке пакета ${currentBatch}: ${error.message}`);
-        }
-    }
-
-    function startProcessing() {
-        const textarea = document.querySelector('.custom-textarea');
-        const lines = textarea.value.trim().split('\n').filter(l => l.trim());
-
-        if (lines.length === 0) {
-            alert('Нет доменов для обработки!');
-            return;
-        }
-
-        const domainRegex = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
-        const validDomains = lines.filter(domain => domainRegex.test(domain.trim()));
-
-        if (validDomains.length === 0) {
-            alert('Не найдено валидных доменов!');
-            return;
-        }
-
-        isProcessing = true;
-        currentBatch = 0;
-        totalDomains = validDomains.length;
-
-        saveProcessingState({
-            domains: validDomains,
-            total: totalDomains,
-            startTime: new Date().toISOString()
-        });
-
-        updateStatus(`Начало обработки: ${totalDomains} доменов`);
-
-        const startBtn = document.querySelector('.custom-start-button');
-        if (startBtn) {
-            startBtn.textContent = 'Остановить';
-            startBtn.className = 'custom-stop-button';
-            startBtn.onclick = stopProcessing;
-        }
-
-        processNextBatch();
-    }
-
-    function stopProcessing() {
-        isProcessing = false;
-
-        const startBtn = document.querySelector('.custom-stop-button');
-        if (startBtn) {
-            startBtn.textContent = 'Запустить обработку';
-            startBtn.className = 'custom-start-button';
-            startBtn.onclick = startProcessing;
-        }
-
-        updateStatus('Обработка остановлена');
-        clearProcessingState();
-    }
-
-    function updateStatus(message) {
-        const statusElement = document.querySelector('.status-info');
-        if (statusElement) {
-            statusElement.textContent = message;
-        }
-    }
-
-    function initContainer() {
-        if (document.querySelector('.custom-container')) return;
-
-        const container = document.createElement('div');
-        container.className = 'custom-container';
-        container.innerHTML = `
-            <div class="custom-header">
-                <span>Ahrefs Batch Helper v3.2</span>
-                <button class="custom-button close-btn">×</button>
-            </div>
-            <div class="custom-content">
-                <textarea class="custom-textarea" placeholder="Введите домены (по одному на строку)..."></textarea>
-                <div class="status-info">Готов к работе</div>
-                <button class="custom-start-button">Запустить обработку</button>
-                <p class="copyright">TG: <a href="https://t.me/seregaseo" target="_blank">Канал Strong SEO</a></p>
-            </div>
-        `;
-        document.body.appendChild(container);
-
-        const textarea = container.querySelector('.custom-textarea');
-        const startBtn = container.querySelector('.custom-start-button');
-        const closeBtn = container.querySelector('.close-btn');
-
-        textarea.value = loadTextarea();
-        textarea.addEventListener('input', () => saveTextarea(textarea.value));
-        closeBtn.addEventListener('click', () => container.remove());
-
-        startBtn.addEventListener('click', startProcessing);
-
-        const savedState = loadProcessingState();
-        if (savedState && savedState.domains && savedState.domains.length > 0) {
-            if (confirm('Найдена незавершенная обработка. Продолжить?')) {
-                resumeIfPending();
-            }
-        }
-    }
-
-    // Резюме по сохранённому состоянию (не требует ввода в нашей textarea)
-    function resumeIfPending() {
-        const savedState = loadProcessingState();
-        if (savedState && savedState.domains && savedState.domains.length > 0) {
-            isProcessing = true;
-            const stopBtn = document.querySelector('.custom-start-button, .custom-stop-button');
-            if (stopBtn) {
-                stopBtn.textContent = 'Остановить';
-                stopBtn.className = 'custom-stop-button';
-                stopBtn.onclick = stopProcessing;
-            }
-            updateStatus('Возобновление обработки...');
-            processNextBatch();
-        }
-    }
-
-    // Автозапуск при загрузке страницы
-    if (document.readyState === 'complete') {
-        initContainer();
-        resumeIfPending();
-    } else {
-        window.addEventListener('load', () => {
-            initContainer();
-            resumeIfPending();
-        });
-    }
-
-    // Автоматическое возобновление при навигации в SPA
-    if (window.onurlchange === null) {
-        window.addEventListener('urlchange', (info) => {
-            const href = (info && info.url) || window.location.href;
-            if (href.includes('/v2-batch-analysis/') && !href.includes('/report')) {
-                setTimeout(() => resumeIfPending(), 1500);
-            }
-        });
-
-        // Проверка текущего URL при инициализации
-        const href = window.location.href;
-        if (href.includes('/v2-batch-analysis/') && !href.includes('/report')) {
-            setTimeout(() => resumeIfPending(), 1500);
-        }
-    }
+    updateStatus('Возобновление обработки...');
+    processNextBatch();
+  }
+
+  // Автозапуск при загрузке
+  if (document.readyState === 'complete') {
+    initContainer();
+    resumeIfPending();
+  } else {
+    window.addEventListener('load', () => {
+      initContainer();
+      resumeIfPending();
+    });
+  }
+
+  // Автопродолжение при SPA-навигации с дебаунсом
+  if (window.onurlchange === null) {
+    window.addEventListener('urlchange', (info) => {
+      const href = (info && info.url) || location.href;
+      if (href.startsWith('https://app.ahrefs.com/v2-batch-analysis')) {
+        if (urlChangeTimer) clearTimeout(urlChangeTimer);
+        urlChangeTimer = setTimeout(() => {
+          resumeIfPending();
+        }, 800);
+      }
+    });
+  }
 })();
+
 
 ````
 
