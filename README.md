@@ -26,10 +26,10 @@
 Сам код 
 
 ```// ==UserScript==
-// @name         Ahrefs Batch Analysis 2.0 Export to CSV (without API KEY)
+// @name         Ahrefs Batch Analysis 2.0 Export to CSV (without API KEY) — Firefox-stable
 // @namespace    http://tampermonkey.net/
-// @version      3.1
-// @description  Ahrefs Batch Analysis 2.0 Export to CSV (without API KEY)
+// @version      3.2
+// @description  Ahrefs Batch Analysis 2.0 Export to CSV (without API KEY) — fixes for SPA routing & Firefox timings
 // @author       Сергей Уткин (https://t.me/seregaseo)
 // @match        https://app.ahrefs.com/v2-batch-analysis*
 // @match        https://app.ahrefs.com/v2-batch-analysis/
@@ -37,6 +37,7 @@
 // @grant        GM_download
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        window.onurlchange
 // ==/UserScript==
 
 (function () {
@@ -46,8 +47,8 @@
         DOMAINS_PER_BATCH: 50,
         INITIAL_POSITION: { bottom: '20px', right: '40px' },
         CONTAINER_SIZE: { width: '380px', height: '480px' },
-        DELAY_BETWEEN_ACTIONS: 2000,
-        WAIT_FOR_TABLE_TIMEOUT: 30000
+        DELAY_BETWEEN_ACTIONS: 2500,        // ↑ запас для Firefox
+        WAIT_FOR_TABLE_TIMEOUT: 60000       // ↑ запас для Firefox
     };
 
     const styles = `
@@ -218,33 +219,57 @@
 
     function waitForElement(selector, timeout = CONFIG.WAIT_FOR_TABLE_TIMEOUT) {
         return new Promise((resolve, reject) => {
-            if (document.querySelector(selector)) {
-                return resolve(document.querySelector(selector));
-            }
+            const existing = document.querySelector(selector);
+            if (existing) return resolve(existing);
 
             const observer = new MutationObserver(() => {
-                if (document.querySelector(selector)) {
+                const el = document.querySelector(selector);
+                if (el) {
                     observer.disconnect();
-                    resolve(document.querySelector(selector));
+                    resolve(el);
                 }
             });
 
-            observer.observe(document.body, {
-                childList: true,
-                subtree: true
-            });
+            observer.observe(document.body, { childList: true, subtree: true });
 
-            setTimeout(() => {
+            const to = setTimeout(() => {
                 observer.disconnect();
                 reject(new Error(`Элемент ${selector} не найден за ${timeout}ms`));
             }, timeout);
+
+            // Безопасность: если промис завершился ранее
+            Promise.resolve().finally(() => clearTimeout(to));
         });
+    }
+
+    // Устойчивое ожидание textarea и кнопки Analyze (исключая свою панель)
+    async function waitForAnalyzeControls(timeout = 60000) {
+        const deadline = Date.now() + timeout;
+
+        // Ждём textarea (не нашу)
+        const textarea = await waitForElement('textarea:not(.custom-textarea)', timeout);
+
+        // Ждём кнопку Analyze вне нашей панели
+        async function findAnalyzeBtn() {
+            const btn = Array.from(document.querySelectorAll('button[type="button"]'))
+                .find(b => b.textContent.trim().toLowerCase() === 'analyze'
+                        && !b.closest('.custom-container'));
+            return btn || null;
+        }
+
+        let analyzeButton = await findAnalyzeBtn();
+        while (!analyzeButton && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 250));
+            analyzeButton = await findAnalyzeBtn();
+        }
+        if (!analyzeButton) throw new Error('Кнопка Analyze не найдена');
+
+        return { textarea, analyzeButton };
     }
 
     function tableToCSV(table) {
         const rows = [];
 
-        // Обновленные заголовки без столбца "#" и с исправленными названиями последних 4 столбцов
         const headers = [
             'Target',
             'Mode',
@@ -283,91 +308,65 @@
             'Outgoing links / Followed'
         ];
 
-        // Добавляем строку с заголовками
         rows.push(headers.join('\t'));
 
-        // Получаем данные из tbody
         const dataRows = table.querySelectorAll('tbody tr');
 
         dataRows.forEach((tr) => {
             const cells = tr.querySelectorAll('td');
 
-            // Пропускаем пустые строки
             let isEmpty = true;
             cells.forEach(td => {
                 if (td.textContent.trim() !== '') {
                     isEmpty = false;
                 }
             });
-
             if (isEmpty) return;
 
-            // Собираем данные из всех ячеек
             const cellsArray = Array.from(cells);
             const row = [];
 
-            // Обрабатываем каждую ячейку
             cellsArray.forEach((td, index) => {
                 let cellText = td.textContent.trim();
 
-                // Очищаем текст
                 cellText = cellText.replace(/"/g, '""')
                                   .replace(/\n/g, ' ')
                                   .replace(/\s+/g, ' ')
                                   .replace(/,/g, '');
 
-                // Для числовых значений убираем пробелы
                 if (cellText.match(/^\d[\d\s]*[\d)]$/)) {
                     cellText = cellText.replace(/\s/g, '');
                 }
 
-                // Индекс 0: пустая колонка (удаляем)
-                // Индекс 1: Mode (из исходной таблицы) - переносим в Target
-                // Индекс 2: Protocol (в исходной таблице)
-                // Индекс 3: IP (в исходной таблице)
-                // Индекс 4+: остальные данные
-
                 if (index === 0) {
-                    // Пропускаем первую колонку (она пустая или содержит номер)
+                    // пропускаем
                 } else if (index === 1) {
-                    // Mode из исходной таблицы - это наш Target
-                    // Убираем trailing slash
                     cellText = cellText.replace(/\/$/, '');
-                    row.push(cellText); // Target
-                    row.push('Subdomains'); // Mode всегда "Subdomains"
+                    row.push(cellText);       // Target
+                    row.push('Subdomains');   // Mode
                 } else if (index === 2) {
-                    // Это Protocol в исходной таблице, пропускаем
+                    // Protocol в исходной таблице — пропускаем
                 } else if (index === 3) {
-                    // IP - добавляем его
-                    row.push(cellText);
-                    // Protocol всегда "both"
-                    row.push('both');
+                    row.push(cellText);       // IP
+                    row.push('both');         // Protocol
                 } else {
-                    // Все остальные данные (начиная с URL Rating)
                     row.push(cellText);
                 }
             });
 
-            // Обрабатываем специальный случай с Organic / Top Countries и Location traffic
-            // Ищем данные в формате "(code, число)"
             for (let i = 0; i < row.length; i++) {
                 if (typeof row[i] === 'string' && row[i].match(/\([a-z]{2},\s*\d+\)/i)) {
                     const match = row[i].match(/\(([a-z]{2}),\s*(\d+)\)/i);
                     if (match) {
                         const countryCode = match[1];
                         const traffic = match[2];
-
-                        // Заменяем текущую ячейку на country code
                         row[i] = countryCode;
-
-                        // Вставляем traffic в следующую ячейку
                         row.splice(i + 1, 0, traffic);
                         break;
                     }
                 }
             }
 
-            // Добавляем строку только если в ней есть данные
             if (row.length > 1 && row.some((cell, idx) => idx > 0 && cell !== '')) {
                 rows.push(row.join('\t'));
             }
@@ -377,7 +376,6 @@
     }
 
     function downloadCSV(csvContent, filename) {
-        // Добавляем BOM для корректного отображения в Excel
         const BOM = '\uFEFF';
         const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
@@ -394,7 +392,6 @@
     function getFirstDomainFromBatch(batchDomains) {
         if (!batchDomains || batchDomains.length === 0) return '';
         const firstDomain = batchDomains[0].trim();
-        // Очищаем домен от протокола и путей
         return firstDomain.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     }
 
@@ -413,41 +410,28 @@
         const remaining = state.domains.length;
         const firstDomain = getFirstDomainFromBatch(batchDomains);
 
-        // Обновляем статус
         updateStatus(`Пакет ${currentBatch}: ${batchDomains.length} доменов (осталось: ${remaining})`);
 
-        // Сохраняем состояние
         saveProcessingState(state);
         saveTextarea(state.domains.join('\n'));
 
-        // Вводим домены и запускаем анализ
-        const inputTextarea = document.querySelector('textarea.css-a7xc1p-textarea');
-        const analyzeButton = Array.from(document.querySelectorAll('button[type="button"]'))
-            .find(btn => btn.textContent.trim() === 'Analyze');
-
-        if (!inputTextarea || !analyzeButton) {
-            stopProcessing();
-            alert('Форма анализа не найдена!');
-            return;
-        }
-
-        setReactTextareaValue(inputTextarea, batchDomains.join('\n'));
-        inputTextarea.focus();
-
-        await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS));
-        analyzeButton.click();
-
-        // Ждем редирект на страницу отчета
-        await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS * 2));
-
-        // Ждем появление таблицы
         try {
-            const table = await waitForElement('table');
+            // Ждём реальную готовность формы
+            const { textarea: inputTextarea, analyzeButton } = await waitForAnalyzeControls(60000);
 
-            // Даем дополнительное время для полной загрузки данных
+            setReactTextareaValue(inputTextarea, batchDomains.join('\n'));
+            inputTextarea.focus();
+
+            await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS));
+            analyzeButton.click();
+
+            // Ждём переход на отчёт и таблицу
+            await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS * 2));
+            const table = await waitForElement('table', CONFIG.WAIT_FOR_TABLE_TIMEOUT * 2);
+
+            // Дать время на полную отрисовку
             await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS * 2));
 
-            // Экспортируем CSV
             const csvContent = tableToCSV(table);
             const timestamp = new Date().toISOString().slice(0,10).replace(/-/g, '-');
             const filename = `batch_analysis_${firstDomain}_${timestamp}.csv`;
@@ -456,10 +440,8 @@
 
             updateStatus(`Пакет ${currentBatch} экспортирован: ${filename}`);
 
-            // Возвращаемся на страницу анализа для следующей пачки
             await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_ACTIONS));
             window.location.href = 'https://app.ahrefs.com/v2-batch-analysis/';
-
         } catch (error) {
             console.error('Ошибка:', error);
             stopProcessing();
@@ -488,7 +470,6 @@
         currentBatch = 0;
         totalDomains = validDomains.length;
 
-        // Сохраняем состояние
         saveProcessingState({
             domains: validDomains,
             total: totalDomains,
@@ -497,20 +478,19 @@
 
         updateStatus(`Начало обработки: ${totalDomains} доменов`);
 
-        // Меняем кнопку
         const startBtn = document.querySelector('.custom-start-button');
-        startBtn.textContent = 'Остановить';
-        startBtn.className = 'custom-stop-button';
-        startBtn.onclick = stopProcessing;
+        if (startBtn) {
+            startBtn.textContent = 'Остановить';
+            startBtn.className = 'custom-stop-button';
+            startBtn.onclick = stopProcessing;
+        }
 
-        // Запускаем первый пакет
         processNextBatch();
     }
 
     function stopProcessing() {
         isProcessing = false;
 
-        // Восстанавливаем кнопку
         const startBtn = document.querySelector('.custom-stop-button');
         if (startBtn) {
             startBtn.textContent = 'Запустить обработку';
@@ -536,7 +516,7 @@
         container.className = 'custom-container';
         container.innerHTML = `
             <div class="custom-header">
-                <span>Ahrefs Batch Helper v3.1</span>
+                <span>Ahrefs Batch Helper v3.2</span>
                 <button class="custom-button close-btn">×</button>
             </div>
             <div class="custom-content">
@@ -552,45 +532,63 @@
         const startBtn = container.querySelector('.custom-start-button');
         const closeBtn = container.querySelector('.close-btn');
 
-        // Загружаем сохраненные домены
         textarea.value = loadTextarea();
         textarea.addEventListener('input', () => saveTextarea(textarea.value));
         closeBtn.addEventListener('click', () => container.remove());
 
         startBtn.addEventListener('click', startProcessing);
 
-        // Проверяем, есть ли незавершенная обработка
         const savedState = loadProcessingState();
         if (savedState && savedState.domains && savedState.domains.length > 0) {
             if (confirm('Найдена незавершенная обработка. Продолжить?')) {
-                startProcessing();
+                resumeIfPending();
             }
+        }
+    }
+
+    // Резюме по сохранённому состоянию (не требует ввода в нашей textarea)
+    function resumeIfPending() {
+        const savedState = loadProcessingState();
+        if (savedState && savedState.domains && savedState.domains.length > 0) {
+            isProcessing = true;
+            const stopBtn = document.querySelector('.custom-start-button, .custom-stop-button');
+            if (stopBtn) {
+                stopBtn.textContent = 'Остановить';
+                stopBtn.className = 'custom-stop-button';
+                stopBtn.onclick = stopProcessing;
+            }
+            updateStatus('Возобновление обработки...');
+            processNextBatch();
         }
     }
 
     // Автозапуск при загрузке страницы
     if (document.readyState === 'complete') {
         initContainer();
+        resumeIfPending();
     } else {
-        window.addEventListener('load', initContainer);
+        window.addEventListener('load', () => {
+            initContainer();
+            resumeIfPending();
+        });
     }
 
-    // Автоматическое продолжение при переходе между страницами
-    const savedState = loadProcessingState();
-    if (savedState && savedState.domains && savedState.domains.length > 0) {
-        if (window.location.href.includes('/v2-batch-analysis/') && !window.location.href.includes('/report')) {
-            // Мы на странице ввода - запускаем обработку
-            setTimeout(() => {
-                if (!document.querySelector('.custom-container')) {
-                    initContainer();
-                }
-                const startBtn = document.querySelector('.custom-start-button');
-                if (startBtn && startBtn.textContent === 'Запустить обработку') {
-                    startProcessing();
-                }
-            }, 2000);
+    // Автоматическое возобновление при навигации в SPA
+    if (window.onurlchange === null) {
+        window.addEventListener('urlchange', (info) => {
+            const href = (info && info.url) || window.location.href;
+            if (href.includes('/v2-batch-analysis/') && !href.includes('/report')) {
+                setTimeout(() => resumeIfPending(), 1500);
+            }
+        });
+
+        // Проверка текущего URL при инициализации
+        const href = window.location.href;
+        if (href.includes('/v2-batch-analysis/') && !href.includes('/report')) {
+            setTimeout(() => resumeIfPending(), 1500);
         }
     }
 })();
+
 ````
 
